@@ -3,8 +3,17 @@ const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
+const http = require('http');
+const { Server } = require('socket.io');
 
 const app = express();
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: {
+    origin: '*',
+    methods: ['GET', 'POST']
+  }
+});
 const PORT = process.env.PORT || 3000;
 const DONATIONS_FILE = path.join(__dirname, 'donations.json');
 
@@ -25,6 +34,48 @@ function readDonations() {
 // Helper: Write donations to file
 function writeDonations(donations) {
   fs.writeFileSync(DONATIONS_FILE, JSON.stringify(donations, null, 2));
+}
+
+// ========================================
+// WEBSOCKET (SOCKET.IO) - REAL-TIME
+// ========================================
+io.on('connection', (socket) => {
+  console.log('🔌 Client connected:', socket.id);
+  
+  // Gửi danh sách donations mới nhất khi client kết nối
+  const donations = readDonations();
+  socket.emit('initial_donations', donations.slice(0, 20));
+  
+  // Gửi stats khi client kết nối
+  const stats = calculateStats(donations);
+  socket.emit('stats_update', stats);
+  
+  socket.on('disconnect', () => {
+    console.log('🔌 Client disconnected:', socket.id);
+  });
+});
+
+// Helper: Calculate stats
+function calculateStats(donations) {
+  const total = donations.reduce((sum, d) => sum + (d.amount || 0), 0);
+  const count = donations.length;
+  const uniqueDonors = [...new Set(donations.map(d => d.name))].length;
+  
+  const totals = {};
+  donations.forEach(d => {
+    totals[d.name] = (totals[d.name] || 0) + d.amount;
+  });
+  const topDonors = Object.entries(totals)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5)
+    .map(([name, total]) => ({ name, total }));
+  
+  return {
+    totalAmount: total,
+    totalCount: count,
+    uniqueDonors: uniqueDonors,
+    topDonors: topDonors
+  };
 }
 
 // ========================================
@@ -72,6 +123,13 @@ app.post('/donations', (req, res) => {
   donations.unshift(newDonation);
   writeDonations(donations);
   
+  // 🎉 Broadcast donation mới cho tất cả clients
+  io.emit('new_donation', newDonation);
+  
+  // Cập nhật stats
+  const stats = calculateStats(donations);
+  io.emit('stats_update', stats);
+  
   res.json({ success: true, donation: newDonation });
 });
 
@@ -82,13 +140,11 @@ app.post('/webhook/vietqr', (req, res) => {
   console.log('=== VietQR Webhook Received ===');
   console.log({ amount, senderName, description, timestamp, transactionId });
   
-  // Validate required fields
   if (!amount || !transactionId) {
     console.log('Missing required fields');
     return res.status(400).json({ error: 'Missing required fields' });
   }
   
-  // Kiểm tra transaction đã được xử lý chưa (idempotency)
   const donations = readDonations();
   const existing = donations.find(d => d.transactionId === transactionId);
   if (existing) {
@@ -96,27 +152,21 @@ app.post('/webhook/vietqr', (req, res) => {
     return res.json({ success: true, message: 'Already processed' });
   }
   
-  // Parse tên từ description hoặc senderName
   let name = senderName || 'Khach';
   if (description) {
-    // VietQR description format: "Tang [Tên] [Số tiền]"
     const match = description.match(/Tang\s+(.+?)(?:\s+\d+|$)/i);
     if (match) name = match[1].trim();
   }
   
-  // Parse message từ description
   let message = '';
   if (description) {
-    // Format: "Tang minh 50000 Chúc mừng sinh nhật"
     const parts = description.split(/\s+/);
-    // Lấy phần sau số tiền làm message
     const amountIndex = parts.findIndex(p => p === String(amount) || p === String(parseInt(amount)));
     if (amountIndex !== -1 && parts[amountIndex + 1]) {
       message = parts.slice(amountIndex + 1).join(' ').substring(0, 500);
     }
   }
   
-  // Tạo donation
   const newDonation = {
     id: uuidv4(),
     name: name.substring(0, 50),
@@ -130,6 +180,11 @@ app.post('/webhook/vietqr', (req, res) => {
   
   donations.unshift(newDonation);
   writeDonations(donations);
+  
+  // 🎉 Broadcast donation mới
+  io.emit('new_donation', newDonation);
+  const stats = calculateStats(donations);
+  io.emit('stats_update', stats);
   
   console.log('Donation saved:', newDonation);
   res.json({ success: true, donation: newDonation });
@@ -161,6 +216,11 @@ app.post('/webhook/mock', (req, res) => {
   donations.unshift(newDonation);
   writeDonations(donations);
   
+  // 🎉 Broadcast donation mới
+  io.emit('new_donation', newDonation);
+  const stats = calculateStats(donations);
+  io.emit('stats_update', stats);
+  
   console.log('Mock donation saved:', newDonation);
   res.json({ success: true, donation: newDonation });
 });
@@ -184,26 +244,8 @@ app.delete('/donations/:id', (req, res) => {
 // GET /stats - Thống kê
 app.get('/stats', (req, res) => {
   const donations = readDonations();
-  const total = donations.reduce((sum, d) => sum + (d.amount || 0), 0);
-  const count = donations.length;
-  const uniqueDonors = [...new Set(donations.map(d => d.name))].length;
-  
-  // Top donors
-  const totals = {};
-  donations.forEach(d => {
-    totals[d.name] = (totals[d.name] || 0) + d.amount;
-  });
-  const topDonors = Object.entries(totals)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 5)
-    .map(([name, total]) => ({ name, total }));
-  
-  res.json({
-    totalAmount: total,
-    totalCount: count,
-    uniqueDonors: uniqueDonors,
-    topDonors: topDonors
-  });
+  const stats = calculateStats(donations);
+  res.json(stats);
 });
 
 // Health check
@@ -214,7 +256,7 @@ app.get('/health', (req, res) => {
 // ========================================
 // START SERVER
 // ========================================
-app.listen(PORT, () => {
+server.listen(PORT, () => {
   console.log(`
 ╔═══════════════════════════════════════════════════════════╗
 ║  Bio Donation Backend Server                             ║
